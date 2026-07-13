@@ -2,7 +2,6 @@ import smartpy as sp
 import json
 
 Guard = sp.io.import_script_from_url("file:contracts/GuardComptroller.py")
-GOV = sp.io.import_script_from_url("file:contracts/Governance.py")
 CToken = sp.io.import_script_from_url("file:contracts/CToken.py")
 BlockLevel = sp.io.import_script_from_url(
     "file:contracts/tests/utils/BlockLevel.py")
@@ -249,37 +248,12 @@ def test():
     )
 
     scenario.h2("Rollback helper only accepts the approved Comptroller")
+    # Live Governance/fTokens are not redeployed; ops must batch this helper
+    # with setComptroller to enforce the whitelist.
     scenario += cmpt.verifyRollbackComptroller(oldComptroller.address).run(
         sender=admin.address, level=bLevel.next())
     scenario += cmpt.verifyRollbackComptroller(alice.address).run(
         sender=admin.address, level=bLevel.next(), valid=False)
-
-    scenario.h2("Governance.rollbackComptroller enforces Guard whitelist")
-    governor = GOV.Governance(admin.address)
-    scenario += governor
-    # Simulate a legacy fToken (mock has no verify call of its own).
-    legacyToken = CTMock.CTokenMock(test_account_snapshot_=sp.record(
-        account=alice.address,
-        cTokenBalance=sp.nat(0),
-        borrowBalance=sp.nat(0),
-        exchangeRateMantissa=exchRate,
-    ))
-    scenario += legacyToken
-    scenario += legacyToken.setComptroller(cmpt.address).run(sender=admin)
-    scenario += governor.rollbackComptroller(sp.record(
-        cToken=legacyToken.address,
-        comptroller=oldComptroller.address,
-        fromComptroller=cmpt.address,
-    )).run(sender=admin.address, level=bLevel.next())
-    scenario.verify(legacyToken.data.comptroller == oldComptroller.address)
-
-    scenario += legacyToken.setComptroller(cmpt.address).run(sender=admin)
-    scenario += governor.rollbackComptroller(sp.record(
-        cToken=legacyToken.address,
-        comptroller=alice.address,
-        fromComptroller=cmpt.address,
-    )).run(sender=admin.address, level=bLevel.next(), valid=False)
-    scenario.verify(legacyToken.data.comptroller == cmpt.address)
 
     scenario.h2("supportMarket lists a market with redeem enabled")
     extra = sp.address("KT1ExtraMarket111111111111111111111")
@@ -400,9 +374,11 @@ def test_ctoken_integration():
     scenario += c1.redeem(redeem_amount).run(
         sender=alice, level=bLevel.current(), valid=False)
 
-    scenario.h2("CToken.setComptroller rollback only to approved address")
-    scenario += c1.setComptroller(alice.address).run(
+    scenario.h2("Ops-style rollback: verify helper then setComptroller")
+    scenario += guard.verifyRollbackComptroller(alice.address).run(
         sender=admin, level=bLevel.next(), valid=False)
+    scenario += guard.verifyRollbackComptroller(permissive.address).run(
+        sender=admin, level=bLevel.next())
     scenario += c1.setComptroller(permissive.address).run(
         sender=admin, level=bLevel.next())
     scenario.verify(c1.data.comptroller == permissive.address)

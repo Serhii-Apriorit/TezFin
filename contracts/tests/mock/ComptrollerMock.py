@@ -132,11 +132,7 @@ class ComptrollerMock(CMPTInterface.ComptrollerInterface):
     @sp.entry_point
     def disableMarket(self, params):
         sp.set_type(params, sp.TUnit)
-
-    @sp.entry_point
-    def verifyRollbackComptroller(self, comptroller):
-        sp.set_type(comptroller, sp.TAddress)
-
+        
     @sp.entry_point
     def setMintPaused(self, params):
         sp.set_type(params, sp.TUnit)

@@ -776,12 +776,6 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         self.verifyMarketListed(cToken)
         self.data.markets[cToken].isListed = sp.bool(False)
 
-    @sp.entry_point
-    def verifyRollbackComptroller(self, comptroller):
-        """Permissive no-op: any successor is allowed. Guard overrides with a whitelist."""
-        sp.verify(sp.amount == sp.utils.nat_to_mutez(0), "TEZ_TRANSFERED")
-        sp.set_type(comptroller, sp.TAddress)
-
     # Helpers
 
     def verifyMarketExists(self, token):

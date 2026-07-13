@@ -58,18 +58,6 @@ class GovernanceInterface(sp.Contract):
     def setComptroller(self, params):
         pass
 
-    """
-        Sets a new comptroller after fromComptroller.verifyRollbackComptroller
-
-        params: TRecord
-            cToken: TAddress
-            comptroller: TAddress
-            fromComptroller: TAddress
-    """
-    @sp.entry_point
-    def rollbackComptroller(self, params):
-        pass
-
     """    
         Accrues interest and updates the interest rate model
 

@@ -245,15 +245,6 @@ class ComptrollerInterface(sp.Contract):
         pass
 
     """
-        Authorize (or reject) a comptroller successor before CToken.setComptroller.
-
-        Full Comptroller: permissive. Guard: whitelist only.
-    """
-    @sp.entry_point
-    def verifyRollbackComptroller(self, comptroller):
-        pass
-
-    """
         Updates max price time difference
 
         params: TInt - The max time difference in seconds

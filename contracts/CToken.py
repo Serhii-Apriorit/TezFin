@@ -846,18 +846,6 @@ class CToken(CTI.CTokenInterface, Exponential.Exponential, SweepTokens.SweepToke
     def setComptroller(self, comptrollerAddress):
         sp.set_type(comptrollerAddress, sp.TAddress)
         self.verifyAdministrator()
-        # Current comptroller authorizes the successor (Guard whitelists;
-        # full Comptroller is permissive). Existing 4f6121a fTokens lack this
-        # call — use Governance.rollbackComptroller for those pools.
-        sp.transfer(
-            comptrollerAddress,
-            sp.mutez(0),
-            sp.contract(
-                sp.TAddress,
-                self.data.comptroller,
-                "verifyRollbackComptroller"
-            ).open_some()
-        )
         self.data.comptroller = comptrollerAddress
 
     """    
