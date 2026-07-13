@@ -1,10 +1,19 @@
 import smartpy as sp
+import json
 
 Guard = sp.io.import_script_from_url("file:contracts/GuardComptroller.py")
+GOV = sp.io.import_script_from_url("file:contracts/Governance.py")
+CToken = sp.io.import_script_from_url("file:contracts/CToken.py")
 BlockLevel = sp.io.import_script_from_url(
     "file:contracts/tests/utils/BlockLevel.py")
 CTMock = sp.io.import_script_from_url(
     "file:contracts/tests/mock/CTokenMock.py")
+CMPT = sp.io.import_script_from_url(
+    "file:contracts/tests/mock/ComptrollerMock.py")
+IRM = sp.io.import_script_from_url(
+    "file:contracts/tests/mock/InterestRateModelMock.py")
+DataRelevance = sp.io.import_script_from_url(
+    "file:contracts/tests/utils/DataRelevance.py")
 
 
 def redeemParams(cToken, redeemer, amount=sp.nat(1)):
@@ -14,6 +23,41 @@ def redeemParams(cToken, redeemer, amount=sp.nat(1)):
         redeemer=redeemer,
         redeemAmount=amount,
     )
+
+
+class TestCToken(CToken.CToken):
+    def __init__(self, comptroller_, interestRateModel_, initialExchangeRateMantissa_, administrator_, metadata_, token_metadata_):
+        CToken.CToken.__init__(
+            self, comptroller_, interestRateModel_, initialExchangeRateMantissa_,
+            administrator_, metadata_, token_metadata_)
+
+    def getCashImpl(self):
+        return self.data.totalSupply // sp.nat(int(1e6))
+
+    def doTransferIn(self, from_, amount):
+        return amount
+
+    def doTransferOut(self, to_, amount, isContract=False):
+        pass
+
+
+def _token_meta():
+    return sp.big_map({
+        "": sp.utils.bytes_of_string("tezos-storage:data"),
+        "data": sp.utils.bytes_of_string(json.dumps({
+            "name": "test",
+            "description": "test",
+            "version": "1.0.0",
+            "authors": ["tezfin"],
+            "homepage": "https://example.com",
+            "interfaces": ["TZIP-007"],
+            "license": {"name": "test"}
+        }))
+    }), {
+        "name": sp.utils.bytes_of_string("Compound token"),
+        "symbol": sp.utils.bytes_of_string("cToken"),
+        "decimals": sp.utils.bytes_of_string("6"),
+    }
 
 
 @sp.add_test(name="GuardComptroller_Tests")
@@ -27,6 +71,7 @@ def test():
     admin = sp.test_account("admin")
     alice = sp.test_account("alice")
     bob = sp.test_account("bob")
+    attacker = sp.test_account("attacker")
     oldComptroller = sp.test_account("oldComptroller")
 
     exchRate = sp.nat(int(1e18))
@@ -147,6 +192,39 @@ def test():
         redeemParams(listed, alice.address)
     ).run(sender=listed, level=debtClearLevel)
 
+    scenario.h2("Unauthenticated caller cannot consume the redeem slot")
+    dosLevel = bLevel.next()
+    scenario += marketA.setAccrualBlockNumber(dosLevel).run(sender=admin)
+    scenario += cmpt.redeemAllowed(
+        redeemParams(listed, alice.address)
+    ).run(sender=attacker.address, level=dosLevel, valid=False)
+    # Legitimate cToken caller still gets the slot in the same block.
+    scenario += cmpt.redeemAllowed(
+        redeemParams(listed, alice.address)
+    ).run(sender=listed, level=dosLevel)
+
+    scenario.h2("Disabled-market debt still blocks redeem elsewhere")
+    scenario += marketB.setBorrowBalance(7).run(sender=admin)
+    scenario += cmpt.disableMarket(collateral).run(
+        sender=admin.address, level=bLevel.next())
+    scenario.verify(cmpt.data.markets[collateral].isListed == False)
+    disabledDebtLevel = bLevel.next()
+    scenario += marketA.setAccrualBlockNumber(disabledDebtLevel).run(sender=admin)
+    scenario += cmpt.redeemAllowed(
+        redeemParams(listed, alice.address)
+    ).run(sender=listed, level=disabledDebtLevel, valid=False)
+
+    scenario.h2("Repay and removeFromLoans remain allowed on disabled markets")
+    scenario += cmpt.repayBorrowAllowed(sp.record(
+        cToken=collateral,
+        payer=alice.address,
+        borrower=alice.address,
+        repayAmount=sp.nat(7),
+    )).run(sender=collateral, level=bLevel.next())
+    scenario += cmpt.removeFromLoans(alice.address).run(
+        sender=collateral, level=bLevel.next())
+    scenario += marketB.setBorrowBalance(0).run(sender=admin)
+
     scenario.h2("Governance can pause market redeem")
     pausedLevel = bLevel.next()
     scenario += cmpt.setMarketRedeemPaused(sp.record(
@@ -176,6 +254,33 @@ def test():
     scenario += cmpt.verifyRollbackComptroller(alice.address).run(
         sender=admin.address, level=bLevel.next(), valid=False)
 
+    scenario.h2("Governance.rollbackComptroller enforces Guard whitelist")
+    governor = GOV.Governance(admin.address)
+    scenario += governor
+    # Simulate a legacy fToken (mock has no verify call of its own).
+    legacyToken = CTMock.CTokenMock(test_account_snapshot_=sp.record(
+        account=alice.address,
+        cTokenBalance=sp.nat(0),
+        borrowBalance=sp.nat(0),
+        exchangeRateMantissa=exchRate,
+    ))
+    scenario += legacyToken
+    scenario += legacyToken.setComptroller(cmpt.address).run(sender=admin)
+    scenario += governor.rollbackComptroller(sp.record(
+        cToken=legacyToken.address,
+        comptroller=oldComptroller.address,
+        fromComptroller=cmpt.address,
+    )).run(sender=admin.address, level=bLevel.next())
+    scenario.verify(legacyToken.data.comptroller == oldComptroller.address)
+
+    scenario += legacyToken.setComptroller(cmpt.address).run(sender=admin)
+    scenario += governor.rollbackComptroller(sp.record(
+        cToken=legacyToken.address,
+        comptroller=alice.address,
+        fromComptroller=cmpt.address,
+    )).run(sender=admin.address, level=bLevel.next(), valid=False)
+    scenario.verify(legacyToken.data.comptroller == cmpt.address)
+
     scenario.h2("supportMarket lists a market with redeem enabled")
     extra = sp.address("KT1ExtraMarket111111111111111111111")
     scenario += cmpt.supportMarket(sp.record(
@@ -191,3 +296,113 @@ def test():
         borrower=alice.address,
         repayAmount=sp.nat(10),
     )).run(sender=extra, level=bLevel.next())
+
+    scenario.h2("Underwater repay is still allowed")
+    scenario += marketA.setBorrowBalance(10 ** 18).run(sender=admin)
+    scenario += cmpt.repayBorrowAllowed(sp.record(
+        cToken=listed,
+        payer=bob.address,
+        borrower=alice.address,
+        repayAmount=sp.nat(1),
+    )).run(sender=listed, level=bLevel.next())
+    scenario += marketA.setBorrowBalance(0).run(sender=admin)
+
+
+@sp.add_test(name="GuardComptroller_CToken_Integration")
+def test_ctoken_integration():
+    """Exercise real CToken redeem/mint gates against Guard (not mock entrypoints)."""
+    bLevel = BlockLevel.BlockLevel()
+    scenario = sp.test_scenario()
+    scenario.add_flag("protocol", "lima")
+
+    scenario.h1("Guard + CToken integration")
+
+    admin = sp.test_account("admin")
+    alice = sp.test_account("alice")
+    exchange_rate = int(1e12)
+    ctoken_decimals = int(1e6)
+
+    permissive = CMPT.ComptrollerMock()
+    scenario += permissive
+    irm = IRM.InterestRateModelMock(
+        borrowRate_=sp.nat(0), supplyRate_=sp.nat(0))
+    scenario += irm
+
+    meta, token_meta = _token_meta()
+    c1 = TestCToken(
+        comptroller_=permissive.address,
+        interestRateModel_=irm.address,
+        initialExchangeRateMantissa_=sp.nat(exchange_rate),
+        administrator_=admin.address,
+        metadata_=meta,
+        token_metadata_=token_meta,
+    )
+    scenario += c1
+
+    debtMarket = CTMock.CTokenMock(
+        test_account_snapshot_=sp.record(
+            account=alice.address,
+            cTokenBalance=sp.nat(0),
+            borrowBalance=sp.nat(0),
+            exchangeRateMantissa=sp.nat(int(1e18)),
+        ),
+        borrowBalance_=0,
+    )
+    scenario += debtMarket
+
+    guard = Guard.GuardComptroller(
+        administrator_=admin.address,
+        markets_=[c1.address, debtMarket.address],
+        approvedRollbackComptroller_=permissive.address,
+    )
+    scenario += guard
+
+    scenario.h2("Mint under permissive comptroller, then switch to Guard")
+    DataRelevance.validateAccrueInterestRelevance(
+        scenario, "mint", bLevel, alice, c1, c1.mint, 100)
+    scenario.verify(
+        c1.data.ledger[alice.address].balance == sp.nat(100 * ctoken_decimals))
+
+    scenario += c1.setComptroller(guard.address).run(
+        sender=admin, level=bLevel.next())
+    scenario.verify(c1.data.comptroller == guard.address)
+
+    scenario.h2("Mint is blocked by Guard on the real CToken path")
+    DataRelevance.updateAccrueInterest(scenario, bLevel, alice, c1)
+    scenario += c1.mint(10).run(
+        sender=alice, level=bLevel.current(), valid=False)
+
+    scenario.h2("Borrow is blocked by Guard on the real CToken path")
+    DataRelevance.updateAccrueInterest(scenario, bLevel, alice, c1)
+    scenario += c1.borrow(1).run(
+        sender=alice, level=bLevel.current(), valid=False)
+
+    scenario.h2("Fresh accrueInterest then redeem succeeds via Guard")
+    DataRelevance.updateAccrueInterest(scenario, bLevel, alice, c1)
+    redeem_amount = 10 * ctoken_decimals
+    scenario += c1.redeem(redeem_amount).run(
+        sender=alice, level=bLevel.current())
+    scenario.verify(
+        c1.data.ledger[alice.address].balance == sp.nat(90 * ctoken_decimals))
+
+    scenario.h2("Second same-block redeem fails through CToken")
+    scenario += c1.redeem(redeem_amount).run(
+        sender=alice, level=bLevel.current(), valid=False)
+
+    scenario.h2("redeemUnderlying works after next-block accrueInterest")
+    DataRelevance.updateAccrueInterest(scenario, bLevel, alice, c1)
+    scenario += c1.redeemUnderlying(10).run(
+        sender=alice, level=bLevel.current())
+
+    scenario.h2("Debt in another market blocks CToken redeem")
+    scenario += debtMarket.setBorrowBalance(5).run(sender=admin)
+    DataRelevance.updateAccrueInterest(scenario, bLevel, alice, c1)
+    scenario += c1.redeem(redeem_amount).run(
+        sender=alice, level=bLevel.current(), valid=False)
+
+    scenario.h2("CToken.setComptroller rollback only to approved address")
+    scenario += c1.setComptroller(alice.address).run(
+        sender=admin, level=bLevel.next(), valid=False)
+    scenario += c1.setComptroller(permissive.address).run(
+        sender=admin, level=bLevel.next())
+    scenario.verify(c1.data.comptroller == permissive.address)

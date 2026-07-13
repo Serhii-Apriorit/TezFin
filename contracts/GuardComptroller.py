@@ -14,6 +14,7 @@ GC_MARKET_REDEEM_ALREADY_USED_THIS_BLOCK = "GC_MARKET_REDEEM_ALREADY_USED_THIS_B
 GC_BORROWER_REDEEM_BLOCKED = "GC_BORROWER_REDEEM_BLOCKED"
 GC_REDEEM_PAUSED = "GC_REDEEM_PAUSED"
 GC_INVALID_ROLLBACK = "GC_INVALID_ROLLBACK"
+GC_INVALID_REDEEM_SENDER = "GC_INVALID_REDEEM_SENDER"
 
 # Minimal market metadata. Do not mirror full Comptroller TMarket —
 # collaterals/loans/liquidity are intentionally unused after setComptroller.
@@ -34,10 +35,11 @@ class GuardComptroller(CMPTInterface.ComptrollerInterface):
 
     Policy (mitigation doc):
       mint / borrow / transfer / liquidate / enter / exit -> reject
-      repayBorrowAllowed -> allow listed markets
+      repayBorrowAllowed -> allow known markets (incl. disabled, for debt clear)
       removeFromLoans -> no-op (must exist for repay-to-zero)
       redeemAllowed -> listed + not paused + fresh accrual + one redeem
-                       per market per block + no debt across markets
+                       per market per block + no debt across allMarkets
+                       (caller must be params.cToken)
                        (params: {cToken, redeemer, redeemAmount})
       seizeAllowed -> False
       liquidateCalculateSeizeTokens -> (0, 0)
@@ -74,24 +76,27 @@ class GuardComptroller(CMPTInterface.ComptrollerInterface):
     def verifyAdministrator(self):
         sp.verify(sp.sender == self.data.administrator, EC.CMPT_NOT_ADMIN)
 
+    def verifyMarketExists(self, token):
+        sp.verify(self.data.markets.contains(token), EC.CMPT_MARKET_NOT_EXISTS)
+
     def verifyMarketListed(self, token):
         sp.verify(self.data.markets.contains(token) &
                   self.data.markets[token].isListed, EC.CMPT_MARKET_NOT_LISTED)
 
     def hasAnyBorrow(self, account):
+        # Scan every market ever supported, including disableMarket'd ones.
         # Do not lazify entrypoints that call this when markets are pre-listed:
         # SmartPy/Michelson asserts on that combination.
         hasBorrow = sp.local("hasBorrow", False)
         sp.for market in self.data.allMarkets.elements():
-            sp.if self.data.markets.contains(market) & self.data.markets[market].isListed:
-                borrowData = sp.view(
-                    "borrowBalanceStoredView",
-                    market,
-                    account,
-                    t=sp.TPair(sp.TNat, sp.TNat)
-                ).open_some("INVALID_BORROW_VIEW")
-                sp.if sp.fst(borrowData) > 0:
-                    hasBorrow.value = True
+            borrowData = sp.view(
+                "borrowBalanceStoredView",
+                market,
+                account,
+                t=sp.TPair(sp.TNat, sp.TNat)
+            ).open_some("INVALID_BORROW_VIEW")
+            sp.if sp.fst(borrowData) > 0:
+                hasBorrow.value = True
         return hasBorrow.value
 
     # ------------------------------------------------------------------
@@ -126,13 +131,16 @@ class GuardComptroller(CMPTInterface.ComptrollerInterface):
     def repayBorrowAllowed(self, params):
         self.verifyNoTez()
         sp.set_type(params, CMPTInterface.TRepayBorrowAllowedParams)
-        self.verifyMarketListed(params.cToken)
+        # Allow repayment in disabled markets so outstanding debt can be cleared.
+        self.verifyMarketExists(params.cToken)
 
     @sp.entry_point
     def redeemAllowed(self, params):
         self.verifyNoTez()
         # 4f6121a ABI: { cToken, redeemer, redeemAmount }
         sp.set_type(params, CMPTInterface.TRedeemAllowedParams)
+        # Only the market cToken may consume the per-block redeem slot.
+        sp.verify(sp.sender == params.cToken, GC_INVALID_REDEEM_SENDER)
         self.verifyMarketListed(params.cToken)
         sp.verify(~ self.data.markets[params.cToken].redeemPaused,
                   GC_REDEEM_PAUSED)
@@ -158,7 +166,7 @@ class GuardComptroller(CMPTInterface.ComptrollerInterface):
         """No-op: Guard does not track loans. Must exist for repay-to-zero."""
         self.verifyNoTez()
         sp.set_type(borrower, sp.TAddress)
-        self.verifyMarketListed(sp.sender)
+        self.verifyMarketExists(sp.sender)
 
     @sp.entry_point
     def enterMarkets(self, cTokens):

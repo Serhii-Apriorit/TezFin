@@ -140,6 +140,36 @@ class Governance(GOVI.GovernanceInterface, SweepTokens.SweepTokens):
                                "setComptroller").open_some()
         sp.transfer(params.comptroller, sp.mutez(0), contract)
 
+    """
+        Sets a new comptroller only after fromComptroller authorizes it.
+
+        Use setComptroller for the one-time Guard install on legacy fTokens.
+        Use this entrypoint to roll back from Guard to an approved Comptroller.
+
+        params: TRecord
+            cToken: TAddress - The address of CToken contract
+            comptroller: TAddress - The address of the new comptroller contract
+            fromComptroller: TAddress - Current comptroller that must approve
+    """
+    @sp.entry_point
+    def rollbackComptroller(self, params):
+        self.verifyAdministrator()
+        sp.set_type(params, sp.TRecord(
+            cToken=sp.TAddress,
+            comptroller=sp.TAddress,
+            fromComptroller=sp.TAddress
+        ).layout(("cToken", ("comptroller", "fromComptroller"))))
+        verifyContract = sp.contract(
+            sp.TAddress,
+            params.fromComptroller,
+            "verifyRollbackComptroller"
+        ).open_some()
+        sp.transfer(params.comptroller, sp.mutez(0), verifyContract)
+        setContract = sp.contract(
+            sp.TAddress, params.cToken, "setComptroller"
+        ).open_some()
+        sp.transfer(params.comptroller, sp.mutez(0), setContract)
+
     """    
         Accrues interest and updates the interest rate model
 
