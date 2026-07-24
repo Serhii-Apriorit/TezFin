@@ -14,9 +14,6 @@ Exponential = sp.io.import_script_from_url(
     "file:contracts/utils/Exponential.py")
 OP = sp.io.import_script_from_url("file:contracts/utils/OperationProtector.py")
 
-SweepTokens = sp.io.import_script_from_url(
-    "file:contracts/utils/SweepTokens.py")
-
 TMarket = sp.TRecord(isListed=sp.TBool,  # Whether or not this market is listed
                      # Multiplier representing the most one can borrow against their collateral in this market.
                      collateralFactor=Exponential.TExp,
@@ -25,6 +22,9 @@ TMarket = sp.TRecord(isListed=sp.TBool,  # Whether or not this market is listed
                      mintPaused=sp.TBool,
                      borrowPaused=sp.TBool,
                      redeemPaused=sp.TBool,
+                     liquidatePaused=sp.TBool,
+                     supplyCap=sp.TNat,
+                     borrowCap=sp.TNat,
                      name=sp.TString,  # Asset name for price oracle
                      price=Exponential.TExp,  # The price of the asset
                      priceExp=sp.TNat,  # exponent needed to normalize the token prices to 10^18
@@ -41,7 +41,7 @@ TLiquidity = sp.TRecord(
 DEFAULT_COLLATERAL_FACTOR = int(5e17)  # 50 %
 
 
-class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, SweepTokens.SweepTokens, OP.OperationProtector):
+class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, OP.OperationProtector):
     def __init__(self, administrator_, oracleAddress_, closeFactorMantissa_, liquidationIncentiveMantissa_, maxAssetsPerUser_=15, **extra_storage):
         Exponential.Exponential.__init__(
             self,
@@ -66,7 +66,6 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             activeOperations=sp.set(t=sp.TNat),
             closeFactorMantissa=closeFactorMantissa_,
             liquidationIncentiveMantissa=liquidationIncentiveMantissa_,
-            maxPriceTimeDifference = sp.int(86400),
             maxAssetsPerUser=maxAssetsPerUser_,
             **extra_storage
         )
@@ -76,7 +75,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         cTokens: TList(TAddress) - The list of addresses of the cToken markets to be enabled
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def enterMarkets(self, cTokens):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -125,7 +124,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         accountSnapshot: TAccountSnapshot - Container for account balance information
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setAccountSnapAndExitMarket(self, accountSnapshot):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -152,7 +151,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             minter: TAddress - The account which would get the minted tokens
             mintAmount: TNat - The amount of underlying being supplied to the market in exchange for tokens
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def mintAllowed(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -160,6 +159,12 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         sp.verify(
             ~ self.data.markets[params.cToken].mintPaused, EC.CMPT_MINT_PAUSED)
         self.verifyMarketListed(params.cToken)
+        marketTotals = sp.view("marketTotals", params.cToken, sp.unit,
+                               t=sp.TPair(sp.TNat, sp.TNat)).open_some(
+                                   "INVALID MARKET TOTALS VIEW")
+        sp.verify(sp.fst(marketTotals) <=
+                  self.data.markets[params.cToken].supplyCap,
+                  EC.CMPT_SUPPLY_CAP_EXCEEDED)
         self.invalidateLiquidity(params.minter)
 
     """
@@ -175,7 +180,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             redeemTokens: TNat - The number of cTokens removed from the redeemer
             exchangeRateMantissa: TNat - The pre-redemption exchange rate, scaled by 1e18
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def redeemAllowed(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -248,7 +253,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             borrower: TAddress - The account which would borrow the tokens
             borrowAmount: TNat - The amount of underlying the account would borrow
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def borrowAllowed(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -256,6 +261,12 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         sp.verify(
             ~ self.data.markets[params.cToken].borrowPaused, EC.CMPT_BORROW_PAUSED)
         self.verifyMarketListed(params.cToken)
+        marketTotals = sp.view("marketTotals", params.cToken, sp.unit,
+                               t=sp.TPair(sp.TNat, sp.TNat)).open_some(
+                                   "INVALID MARKET TOTALS VIEW")
+        sp.verify(sp.snd(marketTotals) <=
+                  self.data.markets[params.cToken].borrowCap,
+                  EC.CMPT_BORROW_CAP_EXCEEDED)
         sp.if self.isNewAssetForUser(params.borrower, params.cToken):
             uniqueAssetsCount = self.getUserUniqueAssetsCount(params.borrower)
             sp.verify(uniqueAssetsCount < self.data.maxAssetsPerUser,
@@ -266,6 +277,15 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
                       EC.CMPT_INVALID_BORROW_SENDER)
         sp.if sp.sender == params.cToken:
             self.addToLoans(params.cToken, params.borrower)
+        sp.transfer(sp.set([params.cToken]), sp.mutez(0), sp.self_entry_point(
+            "updateAssetPricesWithView"))
+        sp.transfer(params, sp.mutez(0), sp.self_entry_point(
+            "completeBorrowAllowed"))
+
+    @sp.entry_point
+    def completeBorrowAllowed(self, params):
+        sp.set_type(params, CMPTInterface.TBorrowAllowedParams)
+        sp.verify(sp.sender == sp.self_address, EC.CMPT_INVALID_BORROW_SENDER)
         self.checkInsuffLiquidityInternal(
             params.cToken, params.borrower, params.borrowAmount)
         self.invalidateLiquidity(params.borrower)
@@ -281,7 +301,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         sp.else:
             self.data.loans[borrower] = sp.set([cToken])
 
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def removeFromLoans(self, borrower):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -298,7 +318,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             borrower: TAddress - The account which would borrowed the asset
             repayAmount: TNat - The amount of the underlying asset the account would repay
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def repayBorrowAllowed(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -320,7 +340,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             dst: TAddress - The account which receives the tokens
             transferTokens: TNat - The number of cTokens to transfer
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def transferAllowed(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -363,17 +383,35 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         self.updateAllAssetPrices()
 
     def updateAllAssetPrices(self):
+        assets = sp.local("assets", sp.set(t=sp.TAddress))
         sp.for asset in self.data.marketNameToAddress.values():
+            sp.if self.data.markets[asset].isListed:
+                assets.value.add(asset)
+        sp.transfer(assets.value, sp.mutez(0), sp.self_entry_point(
+            "updateAssetPricesWithView"))
+
+    @sp.entry_point
+    def updateAssetPricesWithView(self, assets):
+        sp.verify(sp.amount == sp.mutez(0), "TEZ_TRANSFERED")
+        sp.set_type(assets, sp.TSet(sp.TAddress))
+        sp.for asset in assets.elements():
+            self.verifyMarketListed(asset)
             sp.if self.data.markets[asset].updateLevel < sp.level:
-                pricePair = sp.local("pricePair", 
-                    sp.view("getPrice", self.data.oracleAddress, self.data.markets[asset].name + "-USD", 
+                previousRawPrice = self.data.markets[asset].price.mantissa // self.data.markets[asset].priceExp
+                pricePair = sp.local("pricePair",
+                    sp.view("getValidatedPrice", self.data.oracleAddress,
+                        sp.record(comptroller=sp.self_address,
+                                  cToken=asset,
+                                  requestedAsset=self.data.markets[asset].name + "-USD",
+                                  previousPrice=previousRawPrice,
+                                  previousTimestamp=self.data.markets[asset].priceTimestamp),
                         t=sp.TPair(sp.TTimestamp, sp.TNat)).open_some("invalid oracle view call")
                 )
-                sp.if self.data.markets[asset].priceTimestamp!= sp.timestamp(0):
-                    sp.verify(sp.now - sp.fst(pricePair.value) <= self.data.maxPriceTimeDifference, "STALE_ASSET_PRICE")
+                priceTimestamp = sp.fst(pricePair.value)
+                rawPrice = sp.snd(pricePair.value)
                 self.data.markets[asset].price = self.makeExp(
-                    sp.snd(pricePair.value)*self.data.markets[asset].priceExp)
-                self.data.markets[asset].priceTimestamp = sp.fst(pricePair.value)
+                    rawPrice*self.data.markets[asset].priceExp)
+                self.data.markets[asset].priceTimestamp = priceTimestamp
                 self.data.markets[asset].updateLevel = sp.level
 
     def getAssetPrice(self, asset):
@@ -390,8 +428,18 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
         sp.set_type(account, sp.TAddress)
-        self.updateAllAssetPrices()
-        self.accrueAllAssetInterests()
+        accountAssets = sp.local("accountAssets", sp.set(t=sp.TAddress))
+        sp.if self.data.collaterals.contains(account):
+            sp.for asset in self.data.collaterals[account].elements():
+                accountAssets.value.add(asset)
+        sp.if self.data.loans.contains(account):
+            sp.for asset in self.data.loans[account].elements():
+                accountAssets.value.add(asset)
+        sp.transfer(accountAssets.value, sp.mutez(0), sp.self_entry_point(
+            "updateAssetPricesWithView"))
+        sp.for asset in accountAssets.value.elements():
+            sp.transfer(sp.unit, sp.mutez(0), sp.contract(
+                sp.TUnit, asset, entry_point="accrueInterest").open_some())
         self.activateOp(OP.ComptrollerOperations.SET_LIQUIDITY)
         sp.transfer(account, sp.mutez(0), sp.self_entry_point(
             "setAccountLiquidityWithView"))
@@ -401,7 +449,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         account: TAddress - The account to calculate liquidity for
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setAccountLiquidityWithView(self, account):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -415,11 +463,6 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             valid=True
         )
 
-    def accrueAllAssetInterests(self):
-        sp.for asset in self.data.marketNameToAddress.values():
-            sp.transfer(sp.unit, sp.mutez(0), sp.contract(
-                sp.TUnit, asset, entry_point="accrueInterest").open_some())
-
     """
         Determine what the account liquidity would be if the given amounts were redeemed/borrowed,
         updates asset prices and accrues interests if stale
@@ -430,7 +473,6 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
     # def getHypoAccountLiquidity(self, params):
     #     sp.set_type(params, CMPTInterface.TGetAccountLiquidityParams)
     #     self.updateAllAssetPrices()
-    #     self.accrueAllAssetInterests()
     #     sp.transfer((params.data, params.callback), sp.mutez(
     #         0), sp.self_entry_point("returnHypoAccountLiquidity"))
 
@@ -499,7 +541,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         updateAccountLiquidityWithView() needs to be called 
         before executing this to get up-to-date results
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def liquidateBorrowAllowed(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -507,6 +549,10 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         self.verifyMarketListed(params.cTokenBorrowed)
         self.verifyMarketListed(params.cTokenCollateral)
+        sp.verify(~self.data.markets[params.cTokenBorrowed].liquidatePaused,
+              EC.CMPT_LIQUIDATE_PAUSED)
+        sp.verify(~self.data.markets[params.cTokenCollateral].liquidatePaused,
+              EC.CMPT_LIQUIDATE_PAUSED)
 
         liquidity = sp.local(
             "liquidtiy", self.getAccountLiquidityInternal(params.borrower))
@@ -631,7 +677,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         params: TAddress - The address of the new pending governance contract
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setPendingGovernance(self, pendingAdminAddress):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -646,7 +692,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         params: TUnit
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def acceptGovernance(self, unusedArg):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -665,7 +711,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             cToken: TAddress - The address of the market to change the mint pause state
             state: TBool - state, where True - pause, False - activate
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setMintPaused(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -683,7 +729,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             cToken: TAddress - The address of the market to change the borrow pause state
             state: TBool - state, where True - pause, False - activate
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setBorrowPaused(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -695,7 +741,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
     """
         Pause or activate redemptions of a given CToken.
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setRedeemPaused(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -704,6 +750,24 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         self.verifyAdministrator()
         self.data.markets[params.cToken].redeemPaused = params.state
 
+    @sp.entry_point
+    def setLiquidatePaused(self, params):
+        sp.verify(sp.amount == sp.mutez(0), "TEZ_TRANSFERED")
+        sp.set_type(params, sp.TRecord(cToken=sp.TAddress, state=sp.TBool))
+        self.verifyMarketListed(params.cToken)
+        self.verifyAdministrator()
+        self.data.markets[params.cToken].liquidatePaused = params.state
+
+    @sp.entry_point
+    def setMarketCaps(self, params):
+        sp.verify(sp.amount == sp.mutez(0), "TEZ_TRANSFERED")
+        sp.set_type(params, sp.TRecord(cToken=sp.TAddress, supplyCap=sp.TNat,
+                                      borrowCap=sp.TNat))
+        self.verifyMarketListed(params.cToken)
+        self.verifyAdministrator()
+        self.data.markets[params.cToken].supplyCap = params.supplyCap
+        self.data.markets[params.cToken].borrowCap = params.borrowCap
+
     """
         Pause or activate the transfer of CTokens
 
@@ -711,7 +775,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         state: TBool, where True - pause, False - activate
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setTransferPaused(self, state):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -728,14 +792,27 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
         
         NOTE: can only use harbinger or harbinger like oracle
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setPriceOracleAndTimeDiff(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
         sp.set_type(params, sp.TRecord(priceOracle=sp.TAddress, timeDiff=sp.TInt))
         self.verifyAdministrator()
-        self.data.maxPriceTimeDifference = params.timeDiff
         self.data.oracleAddress = params.priceOracle
+        destination = sp.contract(sp.TInt, params.priceOracle,
+                      "configureMaxPriceAge").open_some()
+        sp.transfer(params.timeDiff, sp.mutez(0), destination)
+
+    @sp.entry_point
+    def setPriceBounds(self, params):
+        sp.verify(sp.amount == sp.mutez(0), "TEZ_TRANSFERED")
+        sp.set_type(params, sp.TRecord(cToken=sp.TAddress, minPrice=sp.TNat,
+                                      maxPrice=sp.TNat, maxChangeBps=sp.TNat))
+        self.verifyAdministrator()
+        destination = sp.contract(OracleInterface.TPriceBounds,
+                                  self.data.oracleAddress,
+                                  "configurePriceBounds").open_some()
+        sp.transfer(params, sp.mutez(0), destination)
 
     """
         Sets the closeFactor used when liquidating borrows
@@ -744,7 +821,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         closeFactorMantissa: TNat - New close factor, scaled by 1e18
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setCloseFactor(self, closeFactorMantissa):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -759,7 +836,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         newLimit: TNat - The new limit for the maximum number of unique assets a user can hold
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setMaxAssetsPerUser(self, newLimit):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -776,7 +853,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             cToken: TAddress - The market to set the factor on
             newCollateralFactor: TNat - The new collateral factor, scaled by 1e18
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setCollateralFactor(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -795,7 +872,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         liquidationIncentiveMantissa: TNat - New liquidationIncentive scaled by 1e18
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def setLiquidationIncentive(self, liquidationIncentiveMantissa):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -813,7 +890,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
             name: TString - The market name in price oracle
             priceExp: TNat - exponent needed to normalize the token prices to 10^18 (eth:0, btc: 10, usd: 12)
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def supportMarket(self, params):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
@@ -821,6 +898,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
                     name=sp.TString, priceExp=sp.TNat))
         self.verifyAdministrator()
         self.verifyMarketNotListed(params.cToken)
+        sp.verify(params.priceExp > 0, "INVALID_PRICE_EXP")
         self.data.markets[params.cToken] = sp.record(isListed=sp.bool(True),
                                                      collateralFactor=self.makeExp(
                                                          sp.nat(DEFAULT_COLLATERAL_FACTOR)),
@@ -828,6 +906,9 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
                                                      borrowPaused=sp.bool(
                                                          True),
                                                      redeemPaused=sp.bool(True),
+                                                     liquidatePaused=sp.bool(True),
+                                                     supplyCap=sp.nat(0),
+                                                     borrowCap=sp.nat(0),
                                                      name=params.name,
                                                      price=self.makeExp(
                                                          sp.nat(0)),
@@ -843,7 +924,7 @@ class Comptroller(CMPTInterface.ComptrollerInterface, Exponential.Exponential, S
 
         cToken: TAddress - The address of the market (token) to disable
     """
-    @sp.entry_point(lazify=True)
+    @sp.entry_point
     def disableMarket(self, cToken):
         sp.verify(sp.amount == sp.utils.nat_to_mutez(
             0), "TEZ_TRANSFERED")
