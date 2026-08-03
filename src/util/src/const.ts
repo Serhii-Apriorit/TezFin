@@ -148,6 +148,7 @@ export const mainnetAddresses: ProtocolAddresses = {
   },
   governance: "KT1QScMEtDpXSuj7z2if1EMSqaXaXPnWCxqv",
   oracle: "KT1JiMMNrs6rptrQEZGCyxcZQSSZ8aqLqbYa",
+  priceOracle: "KT1ExbCyFbsvPQTUitHAK7HSfYkJgiCtBGpM",
   network: Network.Mainnet
 };
 

@@ -105,6 +105,7 @@ export interface ProtocolAddresses {
     interestRateModel: { [underlying: string]: string };
     governance: string;
     oracle: string;
+    priceOracle?: string;
     network: Network;
 }
 

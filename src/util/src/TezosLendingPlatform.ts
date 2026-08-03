@@ -112,6 +112,7 @@ export namespace TezosLendingPlatform {
                         protocolAddresses.oracle,
                         head.level,
                         server,
+                        protocolAddresses.priceOracle,
                     );
                     const borrowRate = FToken.getBorrowRate(fTokenStorage, rateModel);
                     const fTokenStorageAfterAccrual = FToken.SimulateAccrueInterest(
